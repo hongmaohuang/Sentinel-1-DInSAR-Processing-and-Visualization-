@@ -1,0 +1,16 @@
+Download images and orbit file via s1_data_search.py with the config file s1_config.json.
+The logs will tell you what to do next!
+
+DInSAR Process:
+1. python -m isce.applications.topsApp --start=preprocess --end=preprocess topsApp.xml
+2. python -m isce.applications.topsApp --start=computeBaselines --end=computeBaselines topsApp.xml
+3. python -m isce.applications.topsApp --start=verifyDEM --end=topo topsApp.xml
+4. python -m isce.applications.topsApp --start=subsetoverlaps --end=subsetoverlaps topsApp.xml
+5. python -m isce.applications.topsApp --start=coarseoffsets --end=coarseoffsets topsApp.xml
+6. python -m isce.applications.topsApp --start=coarseresamp --end=coarseresamp topsApp.xml
+7. python -m isce.applications.topsApp --start=overlapifg --end=rangecoreg topsApp.xml
+8. python -m isce.applications.topsApp --start=fineoffsets --end=unwrap topsApp.xml
+9. python -m isce.applications.topsApp --start=unwrap2stage --end=geocodeoffsets topsApp.xml
+
+Or you can just run the all process in a time
+python -m isce.applications.topsApp --start=preprocess --end=geocodeoffsets topsApp.xml

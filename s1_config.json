@@ -1,0 +1,45 @@
+{
+  "event_date": "2025-08-03",
+  "default_aoi_wkt": "POLYGON((121.2 23.7, 121.8 23.7, 121.8 24.3, 121.2 24.3, 121.2 23.7))",
+  "search": {
+    "flight": "ASC",
+    "pol": "VV",
+    "days": 21,
+    "max_results": 1000,
+    "aoi": null,
+    "plot": false
+  },
+  "topsapp": {
+    "dem": "~/dem/dem.tif",
+    "swaths": [1, 2, 3],
+    "az_looks": 7,
+    "rg_looks": 2,
+    "filter_strength": 0.5,
+    "do_unwrap": false
+  },
+
+  "orbit": {
+    "dir": "S1_orbits",
+    "platform": "S1A",
+    "start": "2025-07-01",
+    "end": "2025-08-20",
+    "retry": 3
+  },
+
+  "phase_file": "./merged/filt_topophase.flat.geo",
+  "unw_file": "./merged/filt_topophase.unw.geo",
+  "phase_band": 1,
+  "unw_band": 2,
+  "phase_cmap": "jet",
+  "unw_cmap": "jet",
+  "phase_series": [-3.14159, 3.14159, 0.05],
+  "unw_series": [-23, 15, 0.05],
+  "projection": "M15c",
+  "shorelines": "0.5p,black",
+  "coast_resolution": "i",
+  "frame": ["WSne", "a0.5f0.25"],
+  "phase_colorbar_label": "Phase (rad)",
+  "unw_colorbar_label": "Unwrapped Phase (rad)"
+}
+
+
