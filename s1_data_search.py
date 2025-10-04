@@ -338,6 +338,7 @@ def main():
     print("  aria2c -i S1_pick/download.txt -x 8 -s 8 -k 1M -d raw")
     print("  mkdir -p REF SEC orbits dem")
     print("  unzip raw/<PRE>.zip  -d REF/   &&  unzip raw/<POST>.zip -d SEC/")
+    print("  python s1_orbit_download.py")
     print("  # Place corresponding *.EOF into orbits/, DEM into", args.dem)
     print("  topsApp.py topsApp.xml --steps   # Verify steps, then run: topsApp.py topsApp.xml")
 
