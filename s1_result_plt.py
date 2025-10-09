@@ -1,3 +1,4 @@
+# %%
 import numpy as np
 import xarray as xr
 import pygmt
@@ -5,7 +6,6 @@ import math
 import json
 from cubbie.read_write_insar_utilities import isce_read_write
 
-# 讀取設定檔
 with open("s1_config.json", "r") as f:
     cfg = json.load(f)
 
@@ -36,7 +36,7 @@ with pygmt.config(MAP_FRAME_TYPE="plain",
     fig.grdimage(grid=z, region=[W, E, S, N],
                  projection=cfg["projection"], cmap="phase.cpt",
                  frame=cfg["frame"])
-    fig.coast(shorelines=cfg["shorelines"], resolution=cfg["coast_resolution"])
+    #fig.coast(shorelines=cfg["shorelines"], resolution=cfg["coast_resolution"])
     fig.colorbar(frame=f"af+l\"{cfg['phase_colorbar_label']}\"")
     fig.savefig("phase.png", dpi=300)
 
@@ -63,6 +63,6 @@ with pygmt.config(MAP_FRAME_TYPE="plain",
     fig.grdimage(grid=z, region=[W, E, S, N],
                  projection=cfg["projection"], cmap="unw.cpt",
                  frame=cfg["frame"])
-    fig.coast(shorelines=cfg["shorelines"], resolution=cfg["coast_resolution"])
+    #fig.coast(shorelines=cfg["shorelines"], resolution=cfg["coast_resolution"])
     fig.colorbar(frame=f"af+l\"{cfg['unw_colorbar_label']}\"")
     fig.savefig("unw.png", dpi=300)

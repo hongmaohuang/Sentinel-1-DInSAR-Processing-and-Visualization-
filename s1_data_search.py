@@ -4,13 +4,16 @@
 """
 - User configurable parameters are stored in s1_config.json
 - Program reads the config file as default values; CLI args can override them.
+- Critical parameters like 'event_date' and 'default_aoi_wkt' are mandatory.
+- This version handles multiple frames per acquisition for full AOI coverage.
 Usage:
   python s1_data_search.py --config s1_config.json
 """
 
-import json, os, argparse, re
+import json, os, argparse, re, sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 import asf_search as asf
 
 # ------------------ Load JSON config ------------------
@@ -27,7 +30,7 @@ def load_config(cfg_path: str):
 
 def cfg_get(dct, path, default=None):
     """
-    Nested dictionary reader: 
+    Nested dictionary reader:
     e.g. cfg_get(cfg, "search.flight", "ASC")
     """
     cur = dct
@@ -36,10 +39,6 @@ def cfg_get(dct, path, default=None):
             return default
         cur = cur[k]
     return cur
-
-# ------------------ Default constants ------------------
-EVENT_DATE = "2024-04-03"
-DEFAULT_AOI_WKT = "POLYGON((121.2 23.7, 121.8 23.7, 121.8 24.3, 121.2 24.3, 121.2 23.7))"
 
 # ---------- Utilities ----------
 def iso2dt(s: str) -> datetime:
@@ -69,48 +68,96 @@ def to_safe(name: str) -> str:
         return name[:-4] + ".SAFE"
     return name + ".SAFE"
 
+def get_bbox_from_wkt(wkt_string: str):
+    """Extracts the bounding box from a WKT POLYGON string."""
+    try:
+        # Find all numbers within the first parenthesis
+        coords_str = re.findall(r"\(([^()]+)\)", wkt_string)
+        if not coords_str:
+            return None
+        
+        points = [float(p) for p in re.findall(r"[-+]?\d*\.?\d+", coords_str[0])]
+        
+        longitudes = points[0::2] # Even indices
+        latitudes = points[1::2]  # Odd indices
+        
+        if not longitudes or not latitudes:
+            return None
+
+        return (min(longitudes), min(latitudes), max(longitudes), max(latitudes))
+    except (IndexError, ValueError):
+        return None
+
 def pick_best_pairs(results, event_dt):
     """
-    Group results by relative orbit; 
-    pick one pre-event and one post-event image that overlap.
+    Revised logic:
+    1. Group images by track, then by date.
+    2. For each track, find the pre/post dates closest to the event.
+    3. Select the track with the shortest temporal baseline.
+    4. Return all images for that best pre-date and post-date pair.
     """
-    from collections import defaultdict
-    groups = defaultdict(list)
+    if not results:
+        return [], {}
+
+    tracks = defaultdict(list)
     for r in results:
         tid = get_track_id(r.properties)
         if tid is not None:
-            groups[tid].append(r)
-    debug = {tid: sorted(g, key=lambda rr: iso2dt(rr.properties["startTime"])) for tid, g in groups.items()}
-    candidates = []
-    for tid, lst in debug.items():
-        pre  = [rr for rr in lst if iso2dt(rr.properties["startTime"]) < event_dt]
-        post = [rr for rr in lst if iso2dt(rr.properties["startTime"]) >= event_dt]
-        if not pre or not post:
-            continue
-        pre_top  = sorted(pre,  key=lambda rr: abs((event_dt - iso2dt(rr.properties["startTime"])).total_seconds()))[:4]
-        post_top = sorted(post, key=lambda rr: abs((iso2dt(rr.properties["startTime"]) - event_dt).total_seconds()))[:4]
-        best = None
-        for a in pre_top:
-            for b in post_top:
-                if not bbox_intersect(bbox_of(a), bbox_of(b), min_overlap_frac=0.02):
-                    continue
-                same_sf = same_slice_or_frame(a, b)
-                dt = abs((iso2dt(b.properties["startTime"]) - iso2dt(a.properties["startTime"])).total_seconds())
-                score = (0 if same_sf is True else (1 if same_sf is None else 2), dt)
-                if (best is None) or (score < best[0]):
-                    best = (score, (tid, a, b))
-        if best is not None:
-            candidates.append(best[1])
-    candidates.sort(key=lambda t: (iso2dt(t[2].properties["startTime"]) - iso2dt(t[1].properties["startTime"])).total_seconds())
-    return candidates, debug
+            tracks[tid].append(r)
 
-def make_topsapp_xml(pre_zip, post_zip, dem_path="~/dem/dem.tif", pol="VV",
-                     swaths=(1,2,3), az_looks=7, rg_looks=2, filter_strength=0.5, do_unwrap=False):
+    candidates = []
+    for tid, track_images in tracks.items():
+        acquisitions = defaultdict(list)
+        for img in track_images:
+            acq_date = iso2dt(img.properties["startTime"]).date()
+            acquisitions[acq_date].append(img)
+
+        pre_dates = sorted([d for d in acquisitions if d < event_dt.date()], reverse=True)
+        post_dates = sorted([d for d in acquisitions if d >= event_dt.date()])
+
+        if not pre_dates or not post_dates:
+            continue
+
+        best_pre_date = pre_dates[0]
+        best_post_date = post_dates[0]
+        
+        pre_group = sorted(acquisitions[best_pre_date], key=lambda r: r.properties["startTime"])
+        post_group = sorted(acquisitions[best_post_date], key=lambda r: r.properties["startTime"])
+        
+        temporal_baseline = (best_post_date - best_pre_date).total_seconds()
+        
+        candidates.append({
+            "tid": tid,
+            "pre": pre_group,
+            "post": post_group,
+            "baseline": temporal_baseline,
+            "orbit_images": track_images
+        })
+
+    if not candidates:
+        all_tracks_sorted = {tid: sorted(g, key=lambda r: r.properties["startTime"]) for tid, g in tracks.items()}
+        return [], all_tracks_sorted
+
+    best_candidate = min(candidates, key=lambda x: x["baseline"])
+    
+    return [best_candidate], {}
+
+def make_topsapp_xml(pre_zips, post_zips, dem_path="~/dem/dem.tif", pol="VV",
+                     swaths=(1,2,3), az_looks=7, rg_looks=2, filter_strength=0.5, do_unwrap=False,
+                     region_of_interest=None):
     """
-    Generate topsApp.xml template.
+    Generate topsApp.xml template, handling lists of SAFE files and region of interest.
     """
-    pre_safe  = to_safe(pre_zip)
-    post_safe = to_safe(post_zip)
+    pre_safes = [f"./REF/{to_safe(name)}" for name in pre_zips]
+    post_safes = [f"./SEC/{to_safe(name)}" for name in post_zips]
+
+    pre_safe_str = json.dumps(pre_safes) if len(pre_safes) > 1 else f'"{pre_safes[0]}"'
+    post_safe_str = json.dumps(post_safes) if len(post_safes) > 1 else f'"{post_safes[0]}"'
+
+    roi_property_line = ""
+    if region_of_interest:
+        roi_property_line = f'    <property name="regionOfInterest">{str(region_of_interest)}</property>'
+
     return f"""<topsApp>
   <component name="topsApp">
     <property name="sensor name">SENTINEL1</property>
@@ -118,14 +165,15 @@ def make_topsapp_xml(pre_zip, post_zip, dem_path="~/dem/dem.tif", pol="VV",
     <property name="azimuth looks">{az_looks}</property>
     <property name="range looks">{rg_looks}</property>
     <property name="filter strength">{filter_strength}</property>
+{roi_property_line}
     <property name="do unwrap">{str(do_unwrap)}</property>
     <component name="reference">
-      <property name="safe">./REF/{pre_safe}</property>
+      <property name="safe">{pre_safe_str}</property>
       <property name="orbit directory">./orbits</property>
       <property name="output directory">./ref</property>
     </component>
     <component name="secondary">
-      <property name="safe">./SEC/{post_safe}</property>
+      <property name="safe">{post_safe_str}</property>
       <property name="orbit directory">./orbits</property>
       <property name="output directory">./sec</property>
     </component>
@@ -165,55 +213,29 @@ def write_footprints_png(results, out_png="footprints.png"):
     fig.savefig(out_png)
     print(f"Footprint saved to {out_png}")
 
-# -------------- bbox and slice/frame check --------------
-def bbox_of(res):
-    ring = res.geometry["coordinates"][0]
-    xs = [p[0] for p in ring]; ys = [p[1] for p in ring]
-    return (min(xs), min(ys), max(xs), max(ys))
-
-def bbox_intersect(b1, b2, min_overlap_frac=0.02):
-    minx1, miny1, maxx1, maxy1 = b1
-    minx2, miny2, maxx2, maxy2 = b2
-    ixmin, iymin = max(minx1, minx2), max(miny1, miny2)
-    ixmax, iymax = min(maxx1, maxx2), min(maxy1, maxy2)
-    if ixmin >= ixmax or iymin >= iymax:
-        return False
-    iarea = (ixmax - ixmin) * (iymax - iymin)
-    a1 = (maxx1 - minx1) * (maxy1 - miny1)
-    a2 = (maxx2 - minx2) * (maxy2 - miny2)
-    ref = max(min(a1, a2), 1e-9)
-    return (iarea / ref) >= min_overlap_frac
-
-def same_slice_or_frame(a, b):
-    pa, pb = a.properties, b.properties
-    keys = ["sliceNumber", "frameNumber", "frame", "sceneFrameNumber"]
-    for k in keys:
-        va, vb = pa.get(k), pb.get(k)
-        if (va is not None) and (vb is not None) and (va == vb):
-            return True
-    return None
-
 # ------------------ Main ------------------
 def main():
-    # Parse --config first
     ap0 = argparse.ArgumentParser(add_help=False)
     ap0.add_argument("--config", default="s1_config.json", help="JSON config file")
     args0, _ = ap0.parse_known_args()
-
     cfg = load_config(args0.config)
 
-    global EVENT_DATE, DEFAULT_AOI_WKT
-    EVENT_DATE = cfg_get(cfg, "event_date", EVENT_DATE)
-    DEFAULT_AOI_WKT = cfg_get(cfg, "default_aoi_wkt", DEFAULT_AOI_WKT)
+    event_date_str = cfg_get(cfg, "event_date")
+    if event_date_str is None:
+        print(f"Error: Missing required parameter 'event_date' in config file '{args0.config}'.")
+        sys.exit(1)
+    default_aoi_wkt = cfg_get(cfg, "default_aoi_wkt")
+    if default_aoi_wkt is None:
+        print(f"Error: Missing required parameter 'default_aoi_wkt' in config file '{args0.config}'.")
+        sys.exit(1)
 
-    # Default values from config
     defcfg = {
         "flight": cfg_get(cfg, "search.flight", "ASC"),
         "pol": cfg_get(cfg, "search.pol", "VV"),
         "days": int(cfg_get(cfg, "search.days", 21)),
         "max": int(cfg_get(cfg, "search.max_results", 1000)),
         "plot": bool(cfg_get(cfg, "search.plot", False)),
-        "aoi": cfg_get(cfg, "search.aoi", None) or DEFAULT_AOI_WKT,
+        "aoi": cfg_get(cfg, "search.aoi") or default_aoi_wkt,
         "dem": cfg_get(cfg, "topsapp.dem", "~/dem/dem.tif"),
         "swaths": tuple(cfg_get(cfg, "topsapp.swaths", [1,2,3])),
         "az_looks": int(cfg_get(cfg, "topsapp.az_looks", 7)),
@@ -221,12 +243,7 @@ def main():
         "filter_strength": float(cfg_get(cfg, "topsapp.filter_strength", 0.5)),
         "do_unwrap": bool(cfg_get(cfg, "topsapp.do_unwrap", False)),
     }
-
-    # argparse with defaults from config
-    ap = argparse.ArgumentParser(
-        description="0403 Hualien DInSAR pair picker (S1 SLC / IW)",
-        parents=[ap0]
-    )
+    ap = argparse.ArgumentParser(description="DInSAR pair picker for Sentinel-1 SLC/IW data", parents=[ap0])
     ap.add_argument("--flight", choices=["ASC","DES","BOTH"], default=defcfg["flight"], help="Orbit direction")
     ap.add_argument("--pol", default=defcfg["pol"], help="Polarization (default VV)")
     ap.add_argument("--days", type=int, default=defcfg["days"], help="Search days before/after event")
@@ -241,31 +258,20 @@ def main():
     ap.add_argument("--do-unwrap", action="store_true" if not defcfg["do_unwrap"] else "store_false")
 
     args = ap.parse_args()
-
     swaths = tuple(int(x) for x in re.split(r"[,\s]+", args.swaths.strip()) if x)
-
-    event_dt = datetime.fromisoformat(EVENT_DATE).replace(tzinfo=timezone.utc)
+    event_dt = datetime.fromisoformat(event_date_str).replace(tzinfo=timezone.utc)
     start = (event_dt - timedelta(days=args.days)).strftime("%Y-%m-%d")
     end   = (event_dt + timedelta(days=args.days)).strftime("%Y-%m-%d")
 
-    fd = None
-    if args.flight == "ASC": fd = "ASCENDING"
-    if args.flight == "DES": fd = "DESCENDING"
-
-    opts = dict(
-        platform=asf.PLATFORM.SENTINEL1,
-        processingLevel="SLC",
-        beamMode="IW",
-        start=f"{start}T00:00:00Z",
-        end=f"{end}T23:59:59Z",
-        maxResults=args.max,
-    )
+    fd = "ASCENDING" if args.flight == "ASC" else "DESCENDING" if args.flight == "DES" else None
+    opts = dict(platform=asf.PLATFORM.SENTINEL1, processingLevel="SLC", beamMode="IW",
+                start=f"{start}T00:00:00Z", end=f"{end}T23:59:59Z", maxResults=args.max)
     if fd: opts["flightDirection"] = fd
 
     print(f"[Config] {args0.config}")
     print(f"Search window: {start} ~ {end}; flight: {args.flight}; pol: {args.pol}")
     res = asf.geo_search(intersectsWith=args.aoi, **opts)
-    if len(res)==0:
+    if not res:
         print("No results found, try larger AOI or wider time window.")
         return
 
@@ -273,74 +279,86 @@ def main():
         if pval is None: return False
         s = str(pval).upper().replace(" ","").replace(",","/").replace("+","/")
         parts = [x for x in s.split("/") if x]
-        return want.upper() in parts or want.upper()==s
+        return want.upper() in parts or want.upper() == s
 
     res = [r for r in res if has_pol(r.properties.get("polarization"), args.pol)]
-    if len(res)==0:
+    if not res:
         print("No results with requested polarization. Try adjusting --pol.")
         return
 
     pairs, debug = pick_best_pairs(res, event_dt)
-    if len(pairs)==0:
-        print("No matching pre/post pairs in same orbit. Orbit summary:")
+    if not pairs:
+        print("No matching pre/post pairs in the same orbit. Orbit summary:")
         for tid, lst in sorted(debug.items(), key=lambda kv: kv[0]):
             times = [iso2dt(x.properties["startTime"]) for x in lst]
             print(f"  Orbit {tid}: {len(lst)} images, {times[0].date()} ~ {times[-1].date()}")
         print("Suggestion: try --flight DES, or increase --days (e.g. 60~400), or expand --aoi.")
         return
 
-    tid, pre, post = pairs[0]
-    pre_name  = get_zipname(pre.properties)
-    post_name = get_zipname(post.properties)
-    print("Selected orbit =", tid)
-    print("PRE :", pre_name,  pre.properties.get("startTime"))
-    print("POST:", post_name, post.properties.get("startTime"))
+    best_pair = pairs[0]
+    tid, pre_group, post_group, orbit_images = best_pair["tid"], best_pair["pre"], best_pair["post"], best_pair["orbit_images"]
+    pre_names = [get_zipname(p.properties) for p in pre_group]
+    post_names = [get_zipname(p.properties) for p in post_group]
+
+    print(f"Selected orbit = {tid}")
+    print(f"PRE  ({pre_group[0].properties['startTime'].split('T')[0]}):")
+    for name in pre_names: print(f"  {name}")
+    print(f"POST ({post_group[0].properties['startTime'].split('T')[0]}):")
+    for name in post_names: print(f"  {name}")
+
+    roi_bbox = get_bbox_from_wkt(default_aoi_wkt)
+    
+    roi_for_xml = None
+    if roi_bbox:
+        min_lon, min_lat, max_lon, max_lat = roi_bbox
+        roi_for_xml = [min_lat, max_lat, min_lon, max_lon]
+        print(f"Region of Interest from AOI (S,N,W,E): {roi_for_xml}")
 
     outdir = Path("S1_pick"); ensure_dir(outdir)
 
     def slim(x):
         p = x.properties
-        return {
-            "name": get_zipname(p),
-            "startTime": p.get("startTime"),
-            "url": p.get("url"),
-            "relativeOrbit": p.get("relativeOrbit"),
-            "pathNumber": p.get("pathNumber"),
-            "flightDirection": p.get("flightDirection"),
-        }
+        return {"name": get_zipname(p), "startTime": p.get("startTime"), "url": p.get("url"),
+                "relativeOrbit": p.get("relativeOrbit"), "pathNumber": p.get("pathNumber"),
+                "flightDirection": p.get("flightDirection")}
+
     with (outdir/"pairs.json").open("w") as f:
-        json.dump([(tid, slim(pre), slim(post))], f, indent=2)
+        json.dump([
+            {"track": tid, "pre": [slim(x) for x in pre_group], "post": [slim(x) for x in post_group],
+             "orbit_images": [slim(x) for x in orbit_images]}
+        ], f, indent=2)
 
     with (outdir/"download.txt").open("w") as f:
-        f.write(pre.properties.get("url","") + "\n")
-        f.write(post.properties.get("url","") + "\n")
-    print("Wrote S1_pick/download.txt and S1_pick/pairs.json")
+        for img in orbit_images:
+            url = img.properties.get("url", "")
+            if url: f.write(url + "\n")
 
     xml_txt = make_topsapp_xml(
-        pre_name, post_name,
-        dem_path=args.dem, pol=args.pol,
-        swaths=swaths,
+        pre_names, post_names, dem_path=args.dem, pol=args.pol, swaths=swaths,
         az_looks=args.az_looks, rg_looks=args.rg_looks,
-        filter_strength=args.filter_strength,
-        do_unwrap=args.do_unwrap
-    )
+        filter_strength=args.filter_strength, do_unwrap=args.do_unwrap,
+        region_of_interest=roi_for_xml)
+    
     Path("topsApp.xml").write_text(xml_txt)
     print("Wrote topsApp.xml (ready to run ISCE2 topsApp)")
 
     if args.plot or defcfg["plot"]:
         write_footprints_png(res, out_png="footprints.png")
 
+    print("\nNext Steps:")
     print("  # Step 1: Setup Earthdata Login credentials")
     print("  echo 'machine urs.earthdata.nasa.gov login <USERNAME> password <PASSWORD>' > ~/.netrc")
     print("  chmod 600 ~/.netrc")
-
     print("  # Step 2: Download Sentinel-1 data")
     print("  aria2c -i S1_pick/download.txt -x 8 -s 8 -k 1M -d raw")
     print("  mkdir -p REF SEC orbits dem")
-    print("  unzip raw/<PRE>.zip  -d REF/   &&  unzip raw/<POST>.zip -d SEC/")
-    print("  python s1_orbit_download.py")
-    print("  # Place corresponding *.EOF into orbits/, DEM into", args.dem)
-    print("  topsApp.py topsApp.xml --steps   # Verify steps, then run: topsApp.py topsApp.xml")
+    print("  # Unzip all PRE images into REF/ and all POST images into SEC/")
+    print("  # e.g., for f in raw/S1A_..._PRE_DATE_...zip; do unzip \"$f\" -d REF/; done")
+    print("  # e.g., for f in raw/S1A_..._POST_DATE_...zip; do unzip \"$f\" -d SEC/; done")
+    print("  python s1_orbit_download.py # (Or a similar script to get orbits for all images)")
+    print("  # Place corresponding *.EOF into orbits/, and your DEM into", args.dem)
+    print(" You can run step by step: python -m isce.applications.topsApp --start=preprocess --end=preprocess topsApp.xml")
+    print(" Or just run all process: python -m isce.applications.topsApp topsApp.xml --steps")
 
 if __name__ == "__main__":
     main()
