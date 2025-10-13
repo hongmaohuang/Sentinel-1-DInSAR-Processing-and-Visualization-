@@ -15,7 +15,7 @@
     "az_looks": 7,
     "rg_looks": 2,
     "filter_strength": 0.5,
-    "do_unwrap": true
+    "do_unwrap": false
   },
 
   "orbit": {
@@ -28,12 +28,16 @@
 
   "phase_file": "./merged/filt_topophase.flat.geo",
   "unw_file": "./merged/filt_topophase.unw.geo",
+  "coherence_file": "./merged/topophase.cor.geo",
   "phase_band": 1,
   "unw_band": 2,
+  "coherence_band": 2,
   "phase_cmap": "jet",
   "unw_cmap": "jet",
   "phase_series": [-3.14159, 3.14159, 0.05],
-  "unw_series": [-50, 50, 0.05],
+  "unw_series": [-200, 200, 5],
+  "los_series": [-150, 150, 5],
+  "coherence_threshold": 0.4,
   "projection": "M15c",
   "shorelines": "0.5p,black",
   "coast_resolution": "i",

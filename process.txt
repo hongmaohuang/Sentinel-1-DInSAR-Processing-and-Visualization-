@@ -1,7 +1,11 @@
 Download images and orbit file via s1_data_search.py with the config file s1_config.json.
 The logs will tell you what to do next!
 
-DInSAR Process:
+
+All process: ['preprocess', 'computeBaselines', 'verifyDEM', 'topo', 'subsetoverlaps', 'coarseoffsets', 'coarseresamp', 'overlapifg', 'prepesd', 'esd', 'rangecoreg', 'fineoffsets', 'fineresamp', 'ion', 'burstifg', 'mergebursts', 'filter', 'unwrap', 'unwrap2stage', 'geocode', 'denseoffsets', 'filteroffsets', 'geocodeoffsets']
+
+
+DInSAR Process options:
 1. python -m isce.applications.topsApp --start=preprocess --end=preprocess topsApp.xml
 2. python -m isce.applications.topsApp --start=computeBaselines --end=computeBaselines topsApp.xml
 3. python -m isce.applications.topsApp --start=verifyDEM --end=topo topsApp.xml
@@ -13,4 +17,34 @@ DInSAR Process:
 9. python -m isce.applications.topsApp --start=unwrap2stage --end=geocodeoffsets topsApp.xml
 
 Or you can just run the all process in a time
-python -m isce.applications.topsApp --start=preprocess --end=geocodeoffsets topsApp.xml
+python -m isce.applications.topsApp --steps topsApp.xml
+
+# Note #
+# I am still figuring out why unwarpping by snaphu cannot be done autoamtically. This is how I do if I want to use snaphu:
+1. Download the all datasets you need, and place them in the right places.
+2. run  python -m isce.applications.topsApp --start=preprocess --end=filter topsApp.xml
+3. cd ./merged
+4. vim snaphu.conf
+5. copy and paste:
+INFILE        filt_topophase.flat
+CORRFILE      topophase.cor
+OUTFILE       filt_topophase.unw
+STATCOSTMODE  DEFO
+LINELENGTH    24145
+# remember to modify the number here, this number could be found in the filt_topophase.flat.xml with the keyword: width
+
+BYTEMASKFILE  snaphu_mask_final.msk
+
+# If snaphu shows the frame is too large, please add the four parameter on tiles
+NTILEROW      5
+NTILECOL      3
+ROWOVRLP      2000
+COLOVRLP      2000
+
+6. make a msk file
+gdal_calc.py -A topophase.cor.vrt --A_band=2 --outfile=snaphu_mask_final.msk --calc="A > 0.3" --type=Byte --format=ENVI --overwrite
+
+7. run /home/hmhuang/miniforge3/envs/insar/lib/python3.9/site-packages/snaphu/snaphu -f snaphu.conf
+8. cd ../
+9. python -m isce.applications.topsApp --start=geocode --end=geocodeoffsets topsApp.xml
+10. python s1_result_plt.py
